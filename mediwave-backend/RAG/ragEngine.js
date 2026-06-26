@@ -55,9 +55,9 @@ async function buildVectorStore() {
       ADD COLUMN IF NOT EXISTS embedding TEXT
     `);
 
-        // Get all products
-        const { rows } = await pool.query("SELECT * FROM products");
-        console.log(`📦 Found ${rows.length} products in database`);
+        // Get all products that need embeddings
+        const { rows } = await pool.query("SELECT * FROM products WHERE embedding IS NULL");
+        console.log(`📦 Found ${rows.length} products needing embeddings in database`);
 
         if (rows.length === 0) {
             console.log("❌ No products found! Add products first.");
@@ -131,7 +131,7 @@ async function searchProducts(question) {
         const contextString = topChunks
             .map(({ product }) => productToText(product))
             .join("\n\n---\n\n");
-            
+
         const topMatches = topChunks.map(c => ({
             product_name: c.product.product_name,
             score: c.score.toFixed(3),
@@ -154,12 +154,12 @@ async function searchProducts(question) {
 // Ask Gemini with retrieved context
 async function askGemini(question, context) {
     const settings = getSettings();
-    
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.5-flash",
-      generationConfig: {
-        maxOutputTokens: settings.maxTokens
-      }
+
+    const model = genAI.getGenerativeModel({
+        model: "gemini-1.5-flash",
+        generationConfig: {
+            maxOutputTokens: settings.maxTokens
+        }
     });
 
     const prompt = `
