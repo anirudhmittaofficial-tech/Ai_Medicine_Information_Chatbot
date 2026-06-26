@@ -1,0 +1,6 @@
+{
+  "similarityThreshold": 0.75,
+  "maxChunks": 4,
+  "maxTokens": 1024,
+  "disclaimer": "This information is for reference only. Please consult a qualified healthcare professional before use."
+}
