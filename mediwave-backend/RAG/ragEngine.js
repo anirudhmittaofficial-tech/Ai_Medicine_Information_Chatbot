@@ -85,11 +85,73 @@ async function buildVectorStore() {
     }
 }
 
-// Search products using cosine similarity
-async function searchProducts(question) {
+// Keyword-based fallback search using in-memory scoring (much more accurate than SQL OR)
+async function keywordSearch(question) {
     try {
-        // Get embedding for the question
-        console.log(`🔍 Searching for: "${question}"`);
+        const settings = getSettings();
+        // Extract meaningful words (3+ chars), ignore common stop words
+        const stopWords = new Set(["what", "the", "for", "how", "can", "use", "used", "is", "are", "does", "much", "many", "about", "with", "this", "that", "old", "boy", "girl", "year", "years", "composition", "dosage", "and", "tell", "me"]);
+        const keywords = question
+            .toLowerCase()
+            .replace(/[^a-z0-9\s-]/g, " ")
+            .split(/\s+/)
+            .filter(w => w.length >= 3 && !stopWords.has(w));
+
+        if (keywords.length === 0) return null;
+
+        // Fetch all products since it's a small dataset (62 rows)
+        const { rows } = await pool.query(`SELECT * FROM products`);
+        
+        // Score products based on keyword matches
+        const scored = rows.map(product => {
+            let score = 0;
+            const searchString = `${product.product_name} ${product.composition} ${product.indication} ${product.description} ${product.category}`.toLowerCase();
+            
+            for (const kw of keywords) {
+                // Exact product name match gets a massive boost
+                if (product.product_name.toLowerCase().includes(kw)) {
+                    score += 10;
+                }
+                // General text match gets normal points
+                else if (searchString.includes(kw)) {
+                    score += 1;
+                }
+            }
+            return { product, score };
+        });
+
+        // Filter out products with 0 matches, sort by score descending
+        const filtered = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+
+        if (filtered.length === 0) return null;
+
+        const topChunks = filtered.slice(0, settings.maxChunks);
+        console.log(`🔑 Keyword fallback matched ${filtered.length} product(s). Top match: ${topChunks[0].product.product_name} (score: ${topChunks[0].score})`);
+
+        const contextString = topChunks.map(c => productToText(c.product)).join("\n\n---\n\n");
+        const topMatches = topChunks.map(c => ({
+            product_name: c.product.product_name,
+            score: "keyword",
+            fields: {
+                composition: c.product.composition,
+                dosage: c.product.dosage,
+                indication: c.product.indication,
+                description: c.product.description
+            }
+        }));
+
+        return { contextString, topMatches };
+    } catch (err) {
+        console.error("❌ Keyword search error:", err.message);
+        return null;
+    }
+}
+
+// Search products: tries embedding-based similarity first, falls back to keyword search
+async function searchProducts(question) {
+    console.log(`🔍 Searching for: "${question}"`);
+
+    try {
         const questionEmbedding = await getEmbedding(question);
 
         // Get all products that have embeddings
@@ -98,8 +160,8 @@ async function searchProducts(question) {
         );
 
         if (rows.length === 0) {
-            console.log("❌ No embeddings found. Run buildStore.js first.");
-            return null;
+            console.log("⚠️  No embeddings found, falling back to keyword search.");
+            return await keywordSearch(question);
         }
 
         // Calculate similarity score for each product
@@ -109,25 +171,18 @@ async function searchProducts(question) {
             return { product, score };
         });
 
-        // Get dynamic settings
         const settings = getSettings();
-
-        // Filter by threshold
         const filtered = scored.filter(s => s.score >= settings.similarityThreshold);
-
-        // Sort by highest similarity
         filtered.sort((a, b) => b.score - a.score);
 
         if (filtered.length === 0) {
-            console.log(`❌ No matches above threshold (${settings.similarityThreshold})`);
-            return null;
+            console.log(`⚠️  No embedding matches above threshold (${settings.similarityThreshold}), falling back to keyword search.`);
+            return await keywordSearch(question);
         }
 
-        // Take top chunks based on dynamic maxChunks
         const topChunks = filtered.slice(0, settings.maxChunks);
         console.log(`✅ Top match: ${topChunks[0].product.product_name} (score: ${topChunks[0].score.toFixed(3)})`);
 
-        // Return context and metadata
         const contextString = topChunks
             .map(({ product }) => productToText(product))
             .join("\n\n---\n\n");
@@ -146,21 +201,22 @@ async function searchProducts(question) {
         return { contextString, topMatches };
 
     } catch (err) {
-        console.error("❌ Search error:", err.message);
-        return null;
+        // Embedding API failed (e.g. quota exceeded 429) — fall back to keyword search
+        console.warn(`⚠️  Embedding API unavailable (${err.message.slice(0, 80)}...). Using keyword search fallback.`);
+        return await keywordSearch(question);
     }
 }
 
-// Ask Gemini with retrieved context
+// Ask Gemini with retrieved context — tries models in order, retries on 429
 async function askGemini(question, context) {
     const settings = getSettings();
 
-    const model = genAI.getGenerativeModel({
-        model: "gemini-1.5-flash",
-        generationConfig: {
-            maxOutputTokens: settings.maxTokens
-        }
-    });
+    // Models tried in order — all have free tiers
+    const MODELS = [
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-1.5-flash-8b",
+    ];
 
     const prompt = `
 You are Mediwave AI, a knowledgeable and friendly medicine information assistant for Mediwave Life Sciences Pvt Ltd. You talk the way a helpful pharmacist would — warm, clear, natural sentences. Never sound like you're reading off a database.
@@ -181,12 +237,55 @@ How to respond:
 
 ${settings.disclaimer}
   `;
+    let lastErr;
+    for (const modelName of MODELS) {
+        try {
+            const model = genAI.getGenerativeModel({
+                model: modelName,
+                generationConfig: { maxOutputTokens: settings.maxTokens }
+            });
+            console.log(`🤖 Trying model: ${modelName}`);
+            const result = await model.generateContent(prompt);
+            return {
+                answer: result.response.text(),
+                promptSent: prompt.trim(),
+                modelUsed: modelName
+            };
+        } catch (err) {
+            lastErr = err;
+            const is429 = err.message.includes("429") || err.message.includes("Too Many Requests");
+            const isQuotaZero = err.message.includes("limit: 0");
 
-    const result = await model.generateContent(prompt);
-    return {
-        answer: result.response.text(),
-        promptSent: prompt.trim()
-    };
+            if (is429 && !isQuotaZero) {
+                // Rate-limited but quota exists — extract retry delay and wait
+                const delayMatch = err.message.match(/retry in ([\d.]+)s/i);
+                const waitMs = delayMatch ? Math.min(parseFloat(delayMatch[1]) * 1000, 60000) : 5000;
+                console.warn(`⏳ Model ${modelName} rate-limited. Waiting ${waitMs / 1000}s before retry...`);
+                await new Promise(r => setTimeout(r, waitMs));
+                // Retry this model once after wait
+                try {
+                    const model2 = genAI.getGenerativeModel({
+                        model: modelName,
+                        generationConfig: { maxOutputTokens: settings.maxTokens }
+                    });
+                    const result2 = await model2.generateContent(prompt);
+                    return {
+                        answer: result2.response.text(),
+                        promptSent: prompt.trim(),
+                        modelUsed: modelName
+                    };
+                } catch (retryErr) {
+                    console.warn(`⚠️  ${modelName} retry failed: ${retryErr.message.slice(0, 60)}`);
+                    lastErr = retryErr;
+                }
+            } else {
+                // Quota = 0 (no free tier) or 404 → skip to next model
+                console.warn(`⚠️  ${modelName} unavailable: ${err.message.slice(0, 80)}`);
+            }
+        }
+    }
+
+    throw new Error(`All AI models unavailable. Please try again in a few minutes. (${lastErr?.message?.slice(0, 100)})`);
 }
 
 module.exports = { buildVectorStore, searchProducts, askGemini, getEmbedding, productToText };

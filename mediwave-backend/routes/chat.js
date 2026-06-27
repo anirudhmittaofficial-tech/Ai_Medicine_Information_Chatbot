@@ -63,7 +63,14 @@ router.post("/", async (req, res) => {
         res.json({ question, answer, conversation_id: convoId, metadata });
 
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("Chat error:", err.message);
+        // Instead of breaking the UI with a 500 error, return a graceful error message as the answer
+        res.json({
+            question,
+            answer: `Sorry, our AI service is currently experiencing high traffic or is unavailable. Please try again in a few minutes.\n\n(Error details: ${err.message})`,
+            conversation_id: req.body.conversation_id, // keep the same convo ID if possible
+            metadata: { topMatches: [], promptSent: "" }
+        });
     }
 });
 
